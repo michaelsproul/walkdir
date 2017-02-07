@@ -191,6 +191,7 @@ struct WalkDirOptions {
     max_open: usize,
     min_depth: usize,
     max_depth: usize,
+    post_order: bool,
     sorter: Option<Box<FnMut(&OsString,&OsString) -> Ordering + 'static>>,
 }
 
@@ -207,6 +208,7 @@ impl WalkDir {
                 max_open: 10,
                 min_depth: 0,
                 max_depth: ::std::usize::MAX,
+                post_order: true,
                 sorter: None,
             },
             root: root.as_ref().to_path_buf(),
@@ -454,11 +456,18 @@ enum DirList {
     /// If there was an error with the initial `fs::read_dir` call, then it is
     /// stored here. (We use an `Option<...>` to make yielding the error
     /// exactly once simpler.)
-    Opened { depth: usize, it: result::Result<ReadDir, Option<Error>> },
+    Opened {
+        dir: DirEntry,
+        depth: usize,
+        it: result::Result<ReadDir, Option<Error>>
+    },
     /// A closed handle.
     ///
     /// All remaining directory entries are read into memory.
-    Closed(vec::IntoIter<Result<fs::DirEntry>>),
+    Closed {
+        dir: DirEntry,
+        it: vec::IntoIter<Result<fs::DirEntry>>
+    },
 }
 
 /// A directory entry.
@@ -487,6 +496,8 @@ pub struct DirEntry {
     /// Is set when this entry was created from a symbolic link and the user
     /// excepts the iterator to follow symbolic links.
     follow_link: bool,
+    /// True if this is the second time we've visited this directory.
+    second_visit: bool,
     /// The depth at which this entry was generated relative to the root.
     depth: usize,
     /// The underlying inode number (Unix only).
@@ -509,11 +520,17 @@ impl Iterator for Iter {
             if self.depth > self.opts.max_depth {
                 // If we've exceeded the max depth, pop the current dir
                 // so that we don't descend.
+                // FIXME: what do we do about post-order visits here?
                 self.pop();
                 continue;
             }
             match self.stack_list.last_mut().unwrap().next() {
-                None => self.pop(),
+                None => {
+                    let last_dir = self.pop();
+                    if self.opts.post_order {
+                        return Some(Ok(last_dir));
+                    }
+                }
                 Some(Err(err)) => return Some(Err(err)),
                 Some(Ok(dent)) => {
                     let dent = itry!(DirEntry::from_entry(self.depth, &dent));
@@ -562,7 +579,7 @@ impl Iter {
         let rd = fs::read_dir(dent.path()).map_err(|err| {
             Some(Error::from_path(self.depth, dent.path().to_path_buf(), err))
         });
-        let mut list = DirList::Opened { depth: self.depth, it: rd };
+        let mut list = DirList::Opened { dir: dent.to_second_visited(), depth: self.depth, it: rd };
         if let Some(ref mut cmp) = self.opts.sorter {
             let mut entries: Vec<_> = list.collect();
             entries.sort_by(|a, b| {
@@ -575,7 +592,7 @@ impl Iter {
                     (&Err(_), &Ok(_)) => Ordering::Less,
                 }
             });
-            list = DirList::Closed(entries.into_iter());
+            list = DirList::Closed { dir: dent.to_second_visited(), it: entries.into_iter() };
         }
         self.stack_list.push(list);
         if self.opts.follow_links {
@@ -583,8 +600,8 @@ impl Iter {
         }
     }
 
-    fn pop(&mut self) {
-        self.stack_list.pop().expect("cannot pop from empty stack");
+    fn pop(&mut self) -> DirEntry {
+        let dir_list = self.stack_list.pop().expect("cannot pop from empty stack");
         if self.opts.follow_links {
             self.stack_path.pop().expect("BUG: list/path stacks out of sync");
         }
@@ -592,6 +609,7 @@ impl Iter {
         // room for at least one more open descriptor and it will
         // always be at the top of the stack.
         self.oldest_opened = min(self.oldest_opened, self.stack_list.len());
+        dir_list.dir()
     }
 
     fn follow(&self, mut dent: DirEntry) -> Result<DirEntry> {
@@ -631,8 +649,18 @@ impl Iter {
 
 impl DirList {
     fn close(&mut self) {
-        if let DirList::Opened { .. } = *self {
-            *self = DirList::Closed(self.collect::<Vec<_>>().into_iter());
+        // FIXME: clone()
+        let root_dir = match *self {
+            DirList::Opened { ref dir, .. } => dir.clone(),
+            _ => return
+        };
+        *self = DirList::Closed { dir: root_dir, it: self.collect::<Vec<_>>().into_iter() };
+    }
+
+    fn dir(self) -> DirEntry {
+        match self {
+            DirList::Opened { dir, .. } |
+            DirList::Closed { dir, .. } => dir
         }
     }
 }
@@ -643,8 +671,8 @@ impl Iterator for DirList {
     #[inline(always)]
     fn next(&mut self) -> Option<Result<fs::DirEntry>> {
         match *self {
-            DirList::Closed(ref mut it) => it.next(),
-            DirList::Opened { depth, ref mut it } => match *it {
+            DirList::Closed { ref mut it, .. } => it.next(),
+            DirList::Opened { depth, ref mut it, .. } => match *it {
                 Err(ref mut err) => err.take().map(Err),
                 Ok(ref mut rd) => rd.next().map(|r| r.map_err(|err| {
                     Error::from_io(depth + 1, err)
@@ -733,6 +761,18 @@ impl DirEntry {
         self.ino
     }
 
+    /// Returns true if this is the second time we've visited this entry as part of a
+    /// post-order traversal.
+    pub fn is_second_visit(&self) -> bool {
+        self.second_visit
+    }
+
+    fn to_second_visited(&self) -> Self {
+        let mut visited = self.clone();
+        visited.second_visit = true;
+        visited
+    }
+
     #[cfg(not(unix))]
     fn from_entry(depth: usize, ent: &fs::DirEntry) -> Result<DirEntry> {
         let ty = try!(ent.file_type().map_err(|err| {
@@ -742,6 +782,7 @@ impl DirEntry {
             path: ent.path(),
             ty: ty,
             follow_link: false,
+            second_visit: false,
             depth: depth,
         })
     }
@@ -757,6 +798,7 @@ impl DirEntry {
             path: ent.path(),
             ty: ty,
             follow_link: false,
+            second_visit: false,
             depth: depth,
             ino: ent.ino(),
         })
@@ -771,6 +813,7 @@ impl DirEntry {
             path: pb,
             ty: md.file_type(),
             follow_link: true,
+            second_visit: false,
             depth: depth,
         })
     }
@@ -786,6 +829,7 @@ impl DirEntry {
             path: pb,
             ty: md.file_type(),
             follow_link: true,
+            second_visit: false,
             depth: depth,
             ino: md.ino(),
         })
@@ -799,6 +843,7 @@ impl Clone for DirEntry {
             path: self.path.clone(),
             ty: self.ty,
             follow_link: self.follow_link,
+            second_visit: self.second_visit,
             depth: self.depth,
         }
     }
@@ -809,6 +854,7 @@ impl Clone for DirEntry {
             path: self.path.clone(),
             ty: self.ty,
             follow_link: self.follow_link,
+            second_visit: self.second_visit,
             depth: self.depth,
             ino: self.ino,
         }
